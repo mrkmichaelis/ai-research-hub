@@ -26,15 +26,44 @@ supabase: Client = create_client(
     os.environ["SUPABASE_SERVICE_KEY"],
 )
 
-
 def get_topics() -> list[dict]:
     res = supabase.table("topics").select("*").execute()
     return res.data or []
 
+def get_due_topics(batch_size: int = 5) -> list[dict]:
+    """Return the topics least recently researched (or never researched).
+
+    Topics are sorted so that never-researched topics come first,
+    followed by the oldest-researched, ensuring every topic gets
+    equal attention over time in a strict rotation.
+    """
+    topics = get_topics()
+    if not topics:
+        return []
+
+    # Get the most recent research entry timestamp per topic
+    entries_resp = (
+        supabase.table("research_entries")
+        .select("topic_id, created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    # Build a map of topic_id -> most recent entry timestamp
+    latest: dict = {}
+    for entry in entries_resp.data or []:
+        tid = entry["topic_id"]
+        if tid not in latest:
+            latest[tid] = entry["created_at"]
+
+    # Sort: never-researched (empty string sorts first) then oldest timestamp first
+    topics.sort(key=lambda t: latest.get(t["id"], ""))
+
+    return topics[:batch_size]
 
 def research_topic(topic_name: str, topic_description: str) -> list[dict]:
     """Ask Groq to produce structured research entries for a topic."""
-    prompt = f"""You are a research agent. Your job is to produce 3 fascinating, accurate research 
+    prompt = f"""You are a research agent. Your job is to produce 3 fascinating, accurate research
 entries about: "{topic_name}" ({topic_description}).
 
 Return ONLY a JSON array with exactly 3 objects. Each object must have:
@@ -60,7 +89,6 @@ Return ONLY the JSON array, no other text."""
             raw = raw[4:]
     return json.loads(raw.strip())
 
-
 def run_agent_for_topic(topic: dict) -> None:
     topic_id = topic["id"]
     topic_name = topic["name"]
@@ -79,17 +107,17 @@ def run_agent_for_topic(topic: dict) -> None:
         for entry in entries:
             supabase.table("research_entries").insert({
                 "topic_id": topic_id,
-                "title":      entry.get("title", "Untitled"),
-                "content":    entry.get("content", ""),
-                "tags":       entry.get("tags", []),
+                "title": entry.get("title", "Untitled"),
+                "content": entry.get("content", ""),
+                "tags": entry.get("tags", []),
                 "source_url": entry.get("source_url"),
             }).execute()
             inserted += 1
 
         supabase.table("agent_runs").update({
-            "status":        "completed",
+            "status": "completed",
             "entries_added": inserted,
-            "finished_at":   datetime.now(timezone.utc).isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", run_id).execute()
 
         log.info(f"Completed: added {inserted} entries for '{topic_name}'")
@@ -97,20 +125,19 @@ def run_agent_for_topic(topic: dict) -> None:
     except Exception as e:
         log.error(f"Agent failed for '{topic_name}': {e}")
         supabase.table("agent_runs").update({
-            "status":      "failed",
-            "error_msg":   str(e),
+            "status": "failed",
+            "error_msg": str(e),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", run_id).execute()
 
-
 def run_all_topics() -> None:
-    topics = get_topics()
+    topics = get_due_topics()
     if not topics:
         log.warning("No topics found in database.")
         return
+    log.info(f"Processing {len(topics)} due topic(s) this run.")
     for topic in topics:
         run_agent_for_topic(topic)
-
 
 def main() -> None:
     log.info("Meta-agent starting up...")
@@ -118,12 +145,3 @@ def main() -> None:
 
     # Schedule: run every 6 hours
     schedule.every(6).hours.do(run_all_topics)
-    log.info("Scheduled to run every 6 hours. Waiting...")
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
-
-if __name__ == "__main__":
-    m
