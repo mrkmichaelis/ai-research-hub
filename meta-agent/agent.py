@@ -61,11 +61,37 @@ def get_due_topics(batch_size: int = 5) -> list[dict]:
 
     return topics[:batch_size]
 
-def research_topic(topic_name: str, topic_description: str) -> list[dict]:
-    """Ask Groq to produce structured research entries for a topic."""
+def get_existing_titles(topic_id: str) -> list[str]:
+    """Fetch all entry titles already stored for a given topic."""
+    resp = (
+        supabase.table("research_entries")
+        .select("title")
+        .eq("topic_id", topic_id)
+        .execute()
+    )
+    return [row["title"] for row in resp.data or []]
+
+def research_topic(
+    topic_name: str,
+    topic_description: str,
+    existing_titles: list[str],
+) -> list[dict]:
+    """Ask Groq to produce structured research entries for a topic,
+    explicitly avoiding titles that already exist in the database.
+    """
+    avoid_section = ""
+    if existing_titles:
+        formatted = "\n".join(f"  - {t}" for t in existing_titles)
+        avoid_section = f"""
+The following entries have ALREADY been researched and must NOT be repeated or closely rephrased:
+{formatted}
+
+Produce entries on entirely different aspects, creatures, myths, or stories not listed above.
+"""
+
     prompt = f"""You are a research agent. Your job is to produce 3 fascinating, accurate research
 entries about: "{topic_name}" ({topic_description}).
-
+{avoid_section}
 Return ONLY a JSON array with exactly 3 objects. Each object must have:
 - "title": a concise headline (max 10 words)
 - "content": a detailed paragraph (100-200 words) with interesting facts
@@ -102,17 +128,42 @@ def run_agent_for_topic(topic: dict) -> None:
     run_id = run_res.data[0]["id"]
 
     try:
-        entries = research_topic(topic_name, topic.get("description") or "")
+        # Fetch existing titles — used for both prompt-level and DB-level dedup
+        existing_titles = get_existing_titles(topic_id)
+        existing_normalized = {t.strip().lower() for t in existing_titles}
+        log.info(
+            f"Found {len(existing_titles)} existing entries for '{topic_name}' "
+            f"— sending to AI to avoid repeats."
+        )
+
+        entries = research_topic(
+            topic_name,
+            topic.get("description") or "",
+            existing_titles,
+        )
+
         inserted = 0
+        skipped = 0
         for entry in entries:
+            title = entry.get("title", "Untitled")
+
+            # DB-level dedup: skip if this title (case-insensitive) already exists
+            if title.strip().lower() in existing_normalized:
+                log.info(f"  Skipping duplicate: '{title}'")
+                skipped += 1
+                continue
+
             supabase.table("research_entries").insert({
                 "topic_id": topic_id,
-                "title": entry.get("title", "Untitled"),
+                "title": title,
                 "content": entry.get("content", ""),
                 "tags": entry.get("tags", []),
                 "source_url": entry.get("source_url"),
             }).execute()
+
             inserted += 1
+            # Track within this batch too, in case AI returns two near-identical titles
+            existing_normalized.add(title.strip().lower())
 
         supabase.table("agent_runs").update({
             "status": "completed",
@@ -120,7 +171,9 @@ def run_agent_for_topic(topic: dict) -> None:
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", run_id).execute()
 
-        log.info(f"Completed: added {inserted} entries for '{topic_name}'")
+        log.info(
+            f"Completed '{topic_name}': {inserted} new, {skipped} duplicate(s) skipped."
+        )
 
     except Exception as e:
         log.error(f"Agent failed for '{topic_name}': {e}")
