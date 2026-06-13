@@ -7,7 +7,7 @@ export const revalidate = 60; // ISR: refresh every 60s
 async function getData() {
   const [topicsRes, entriesRes] = await Promise.all([
     supabase.from('topics').select('*').order('name'),
-    supabase.from('research_entries').select('*').order('created_at', { ascending: false }).limit(12),
+    supabase.from('research_entries').select('*').neq('flagged_hallucination', true).order('created_at', { ascending: false }).limit(12),
   ]);
   return {
     topics: (topicsRes.data ?? []) as Topic[],
